@@ -1,0 +1,14 @@
+[Unit]
+Description=k-clock
+After=network.target
+
+[Service]
+ExecStart=/home/mauricio/projects/k-clock/startup.sh
+WorkingDirectory=/home/mauricio/projects/k-clock
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
