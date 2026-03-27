@@ -12,18 +12,24 @@
  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import asyncio
 import argparse
 import datetime
+from datetime import timedelta
+import json
 import logging
+import math
 import os
-import struct
-import wave
+import re
+import random
 from argparse import Namespace
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
+import python_weather
 import pvporcupine
+import pvrhino
 from pixelblaze import Pixelblaze
 from pvrecorder import PvRecorder
 
@@ -36,7 +42,161 @@ logging.basicConfig(level=logging.INFO,
                     ])
 logger = logging.getLogger("k-clock")
 
-def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
+moonIndex = 2
+MOON_PHASES = {"NEW_MOON" : 0,
+    "WAXING_CRESCENT": 1,
+    "FIRST_QUARTER": 2,
+    "WAXING_GIBBOUS": 3,
+    "FULL_MOON": 4,
+    "WANING_GIBBOUS": 5,
+    "LAST_QUARTER": 6,
+    "WANING_CRESCENT": 7}
+
+def save_pattern_code(pb: Pixelblaze, pattern_name: str, dest_path: str = '.') -> bool:
+    pattern_list = pb.getPatternList(True)
+    pattern_id = next((pid for pid, name in pattern_list.items() if name == pattern_name), None)
+    if pattern_id is None:
+        logger.info(f"Pattern '{pattern_name}' not found on device")
+        return False
+    try:
+        source = json.loads(pb.getPatternSourceCode(pattern_id)).get('main', '')
+        out_path = os.path.join(dest_path, f'{pattern_name}.js')
+        with open(out_path, 'w') as f:
+            f.write(source)
+        logger.info(f"Saved '{pattern_name}' to {out_path}")
+        return True
+    except Exception as e:
+        logger.info(f"Failed to save '{pattern_name}': {e}")
+        return False
+
+
+def migrate_clock_patterns(pb: Pixelblaze, dest_path: str = 'migration'):
+    os.makedirs(dest_path, exist_ok=True)
+    pattern_list = pb.getPatternList(True)
+    clock_patterns = {pid: name for pid, name in pattern_list.items() if name.startswith('Clock')}
+
+    scroll_out_id = next((pid for pid, name in clock_patterns.items() if name == 'Clock Scroll Out'), None)
+    if scroll_out_id is None:
+        logger.info("Clock Scroll Out not found — cannot migrate")
+        return
+    scroll_out_source = json.loads(pb.getPatternSourceCode(scroll_out_id)).get('main', '')
+
+    # Clock scaffold = everything from 'var color = 0.0' onwards (wakeMode, scroll state machine, digit rendering)
+    scaffold_match = re.search(r'^var color\s*=\s*0\.0\s*$', scroll_out_source, re.MULTILINE)
+    if scaffold_match is None:
+        logger.info("Could not identify clock scaffold boundary in Clock Scroll Out")
+        return
+    clock_scaffold = scroll_out_source[scaffold_match.start():]
+
+    for pattern_id, pattern_name in sorted(clock_patterns.items(), key=lambda x: x[1]):
+        if pattern_name == 'Clock Scroll Out':
+            source = scroll_out_source
+            logger.info(f"'{pattern_name}': kept as-is (template)")
+        else:
+            try:
+                source = json.loads(pb.getPatternSourceCode(pattern_id)).get('main', '')
+            except Exception as e:
+                logger.info(f"Skipping '{pattern_name}': {e}")
+                continue
+
+            # Background section = everything before the clock section marker
+            split_match = re.search(r'^var color\s*=\s*0\.0\s*$', source, re.MULTILINE)
+            background = source[:split_match.start()].rstrip() + '\n' if split_match else source.rstrip() + '\n'
+
+            # Ensure background section has both background aliases
+            if not re.search(r'\bbeforeRenderBackground\b', background):
+                background += '\nvar beforeRenderBackground = (delta) => {}\n'
+                logger.info(f"'{pattern_name}': added beforeRenderBackground stub")
+            if not re.search(r'\brenderBackground\b', background):
+                background += 'var renderBackground = (index, x, y) => {}\n'
+                logger.info(f"'{pattern_name}': added renderBackground stub")
+
+            source = background + '\n' + clock_scaffold
+            logger.info(f"'{pattern_name}': background preserved, clock scaffold applied")
+
+        safe_name = re.sub(r'[/\\:*?"<>|]', '_', pattern_name)
+        out_path = os.path.join(dest_path, f'{safe_name}.js')
+        with open(out_path, 'w') as f:
+            f.write(source)
+        logger.info(f"  → {out_path}")
+
+
+def upload_patterns_from_directory(pb: Pixelblaze, src_path: str = 'migration'):
+    pattern_list = pb.getPatternList(True)
+    name_to_id = {name: pid for pid, name in pattern_list.items()}
+
+    js_files = [f for f in os.listdir(src_path) if f.endswith('.js')]
+    for file_name in sorted(js_files):
+        pattern_name = file_name[:-3]  # strip .js
+        src_file = os.path.join(src_path, file_name)
+        with open(src_file, 'r') as f:
+            source = f.read()
+
+        pattern_id = name_to_id.get(pattern_name)
+        if pattern_id is None:
+            logger.info(f"'{pattern_name}' not found on device — skipping")
+            continue
+
+        try:
+            preview = pb.getPreviewImage(pattern_id)
+            pb.savePattern(previewImage=preview, sourceCode=source, name=pattern_name, id=pattern_id)
+            logger.info(f"Uploaded '{pattern_name}' ({pattern_id})")
+        except Exception as e:
+            logger.info(f"Failed to upload '{pattern_name}': {e}")
+
+
+def build_pattern_file_cache(pb: Pixelblaze) -> dict:
+    cache = {}
+    pattern_list = pb.getPatternList(True)
+    for file_name in pb.getFileList():
+        if not file_name.endswith('.c'):
+            continue
+        pattern_id = os.path.basename(file_name).replace('.c', '')
+        pattern_name = pattern_list.get(pattern_id, '')
+        if not pattern_name.startswith('Clock'):
+            continue
+        try:
+            data = json.loads(pb.getFile(file_name))
+            cache[file_name] = (pattern_name, data)
+        except Exception as e:
+            logger.info(f"Skipping {file_name}: {e}")
+    return cache
+
+
+def ensure_pattern_variables(pb: Pixelblaze, clock_on: int, cache: dict):
+    for file_name, (pattern_name, data) in cache.items():
+        changed = False
+        if 'wakeMode' not in data or data['wakeMode'] != 0:
+            data['wakeMode'] = 0
+            changed = True
+        if 'clockOn' not in data or data['clockOn'] != clock_on:
+            data['clockOn'] = clock_on
+            changed = True
+        if changed:
+            logger.info(f"Updating variables in {file_name} ({pattern_name})")
+            pb.putFile(file_name, json.dumps(data).encode())
+
+
+def fire_trigger(pb: Pixelblaze, cache: dict, trigger_name: str):
+    """Set trigger=1 on all Clock patterns that have that control."""
+    for file_name, (pattern_name, data) in cache.items():
+        pattern_id = os.path.basename(file_name).replace('.c', '')
+        try:
+            controls = pb.getPatternControls(pattern_id)
+            if controls and trigger_name in controls:
+                data[trigger_name] = 1
+                pb.putFile(file_name, json.dumps(data).encode())
+                logger.info(f"Set {trigger_name} in {file_name} ({pattern_name})")
+        except Exception as e:
+            logger.info(f"Could not check controls for {pattern_name}: {e}")
+    try:
+        pb.setActiveControls({trigger_name: 1})
+        logger.info(f"Fired {trigger_name} on active pattern")
+    except Exception as e:
+        logger.info(f"Could not fire {trigger_name} on active pattern: {e}")
+
+
+async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
     try:
         porcupine = pvporcupine.create(
             access_key=args.access_key,
@@ -45,6 +205,11 @@ def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
             device=args.device,
             keyword_paths=keyword_paths,
             sensitivities=args.sensitivities)
+        rhino = pvrhino.create(
+            access_key=args.access_key,
+            library_path=args.library_path,
+            model_path=args.model_path,
+            context_path=args.context_path,)
     except pvporcupine.PorcupineInvalidArgumentError as e:
         print("One or more arguments provided to Porcupine is invalid: ", args)
         print(e)
@@ -80,60 +245,123 @@ def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
         device_index=args.audio_device_index)
     recorder.start()
 
-    wav_file = None
-    if args.output_path is not None:
-        wav_file = wave.open(args.output_path, "w")
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(16000)
-
     pixelblazes = list(Pixelblaze.EnumerateAddresses(timeout=5000))
-    pattern_list = None
     clock_ipaddress = None
-    pb = None
     for ipAddress in pixelblazes:
-        with Pixelblaze(ipAddress) as pb:
-            try:
-                logger.info(f"Checking to see if '{ipAddress}' is the correct one...")
+        logger.info(f"Checking to see if '{ipAddress}' is the correct one...")
+        try:
+            with Pixelblaze(ipAddress) as pb:
                 config = pb.getConfigSettings()
-                if config["name"] == "testBed":
+                if config["name"] == "k-clock":
                     clock_ipaddress = ipAddress
-                    logger.info(f"Found testBed at '{clock_ipaddress}'")
-                    pb = Pixelblaze(clock_ipaddress)
-                    pattern_list = {v: k for k, v in pb.getPatternList().items()}
+                    logger.info(f"Found k-clock at '{clock_ipaddress}'")
+                    pattern_names_list = ["Clock Fire", "Clock honeycomb", "Clock", "coronal mass ejection", "spiral twirls 2D", "pulse 2D", "perlin fire wind", "Coral Plasma"]
+                    pattern_file_cache = build_pattern_file_cache(pb)
+                    ensure_pattern_variables(pb, 1, pattern_file_cache)
                     break
-            except:
-                continue
+        except:
+            continue
     if clock_ipaddress is None:
-        logger.info("Rebooting due to testBed not found on the network")
-        os.system("sudo reboot")
+        logger.info("Rebooting due to k-clock not found on the network")
+        #os.system("sudo reboot")
 
-    logger.info('Listening ... (press Ctrl+C to exit)')
+    logger.info('Listening...')
 
     try:
+        last_brightness = datetime.now()
         while True:
             pcm = recorder.read()
             result = porcupine.process(pcm)
-
-            if wav_file is not None:
-                wav_file.writeframes(struct.pack("h" * len(pcm), *pcm))
-
+            now = datetime.now()
+            if now - last_brightness > timedelta(minutes=15):
+                last_brightness = now
+                async with python_weather.Client(unit=python_weather.IMPERIAL) as client:
+                    try:
+                        now = datetime.now()
+                        brightness = (-math.cos(
+                            (now.hour + (now.minute / 60.0)) / 24.0 * 2.0 * math.pi) + 1.0) / 2.0 * 0.45 + 0.3
+                        logger.info(f"\tBrightness: {brightness:.2f}")
+                        with Pixelblaze(clock_ipaddress) as pb:
+                            pb.setBrightnessSlider(brightness)
+                    except Exception as e:
+                        logger.info(f"Exception during setting brightness {e}")
             if result >= 0:
-                active_pattern = pb.getActivePattern()
-                if active_pattern == pattern_list['Clock honeycomb']:
-                    pb.setActivePatternByName('Clock')
-                else:
-                    pb.setActivePatternByName('Clock honeycomb')
-                logger.info("Complete")
-
-                logger.info('Detected %s' % (keywords[result]))
+                with Pixelblaze(clock_ipaddress) as pb:
+                    logger.info('Detected %s' % (keywords[result]))
+                    pattern_before_wake = pb.getActivePattern()
+                    pb.setActiveVariables({'wakeMode': 1})
+                    woken = datetime.now()
+                    while True:
+                        if (datetime.now() - woken).seconds > 5:
+                            logger.info("Timeout, going back to listening")
+                            pb.setActiveVariables({'wakeMode': 0})
+                            break
+                        pcm = recorder.read()
+                        is_finalized = rhino.process(pcm)
+                        if is_finalized:
+                            pb.setActiveVariables({'wakeMode': 0})
+                            inference = rhino.get_inference()
+                            if inference.is_understood:
+                                intent = inference.intent
+                                slots = inference.slots
+                                if intent == "setPattern":
+                                    active_pattern = pb.getActivePattern()
+                                    if slots['pattern'] == 'time' and active_pattern != 'time':
+                                        logger.info("Set pattern to time")
+                                        pb.setActivePatternByName('Clock')
+                                    elif slots['pattern'] == 'moon phase' and active_pattern != 'moon_phase':
+                                        logger.info("Set pattern to moon phase")
+                                        async with python_weather.Client(unit=python_weather.IMPERIAL) as client:
+                                            try:
+                                                weather = await client.get('Oakland')
+                                                moon_phase_index = MOON_PHASES[weather.daily_forecasts[0].moon_phase.name]
+                                                logger.info(f"\tMoon phase: {weather.daily_forecasts[0].moon_phase.name} ({moon_phase_index})")
+                                                pattern_list = pb.getPatternList(True)
+                                                moon_id = next((pid for pid, name in pattern_list.items() if name == 'moon phase'), None)
+                                                if moon_id:
+                                                    c_file = f'/p/{moon_id}.c'
+                                                    controls = json.loads(pb.getFile(c_file))
+                                                    controls['sliderMoonIndex'] = moon_phase_index / 8.0
+                                                    pb.putFile(c_file, json.dumps(controls).encode())
+                                                pb.setActivePatternByName('moon phase')
+                                            except Exception as e:
+                                                logger.info(f"Exception during setting weather and variables {e}")
+                                            await asyncio.sleep(5)
+                                            pb.setActivePattern(pattern_before_wake)
+                                            pb.playSequencer()
+                                    elif slots['pattern'] == 'random':
+                                        pattern_name = random.choice(pattern_names_list)
+                                        logger.info(f"Set pattern to random: {pattern_name}")
+                                        pb.setActivePatternByName(pattern_name)
+                                    elif slots['pattern'] == 'clock on':
+                                        logger.info(f"Turn on clock")
+                                        pb.setActiveVariables({"clockOn": 1})
+                                        ensure_pattern_variables(pb, 1, pattern_file_cache)
+                                        fire_trigger(pb, pattern_file_cache, 'triggerScrollIn')
+                                        await asyncio.sleep(1)
+                                    elif slots['pattern'] == 'clock off':
+                                        logger.info(f"Turn off clock")
+                                        pb.setActiveVariables({"clockOn": 0})
+                                        ensure_pattern_variables(pb, 0, pattern_file_cache)
+                                        fire_trigger(pb, pattern_file_cache, 'triggerScrollOut')
+                                        await asyncio.sleep(1)
+                                    logger.info("Complete")
+                                    break
+                                elif intent == "nextPattern":
+                                    if slots['player'] == 'continue':
+                                        logger.info(f"Continue sequence")
+                                        pb.setActivePattern(pattern_before_wake)
+                                        pb.playSequencer()
+                                    elif slots['player'] == 'pause':
+                                        logger.info(f"Pause sequence")
+                                        pb.setActivePattern(pattern_before_wake)
+                                        pb.pauseSequencer()
+                                    break
     except KeyboardInterrupt:
         logger.info('Stopping ...')
     finally:
         recorder.delete()
         porcupine.delete()
-        if wav_file is not None:
-            wav_file.close()
 
 def main():
     parser = argparse.ArgumentParser()
@@ -141,7 +369,6 @@ def main():
     parser.add_argument(
         '--access_key',
         help='AccessKey obtained from Picovoice Console (https://console.picovoice.ai/)')
-
     parser.add_argument(
         '--keywords',
         nargs='+',
@@ -149,26 +376,21 @@ def main():
             '%s' % w for w in sorted(pvporcupine.KEYWORDS)),
         choices=sorted(pvporcupine.KEYWORDS),
         metavar='')
-
     parser.add_argument(
         '--keyword_paths',
         nargs='+',
         help="Absolute paths to keyword model files. If not set it will be populated from `--keywords` argument")
-
     parser.add_argument(
         '--library_path',
         help='Absolute path to dynamic library. Default: using the library provided by `pvporcupine`')
-
     parser.add_argument(
         '--model_path',
         help='Absolute path to the file containing model parameters. '
              'Default: using the library provided by `pvporcupine`')
-
     parser.add_argument(
         '--device',
         help='Device to run inference on (`best`, `cpu:{num_threads}` or `gpu:{gpu_index}`). '
              'Default: automatically selects best device')
-
     parser.add_argument(
         '--sensitivities',
         nargs='+',
@@ -177,13 +399,11 @@ def main():
              "will be used.",
         type=float,
         default=None)
-
+    parser.add_argument(
+        '--context_path',
+        help="Absolute path to context file.")
     parser.add_argument('--audio_device_index', help='Index of input audio device.', type=int, default=-1)
-
-    parser.add_argument('--output_path', help='Absolute path to recorded audio for debugging.', default=None)
-
     parser.add_argument('--show_audio_devices', action='store_true')
-
     parser.add_argument(
         '--show_inference_devices',
         action='store_true',
@@ -217,7 +437,7 @@ def main():
     if len(keyword_paths) != len(args.sensitivities):
         raise ValueError('Number of keywords does not match the number of sensitivities.')
 
-    listen_and_process(args, keyword_paths)
+    asyncio.run(listen_and_process(args, keyword_paths))
 
 
 if __name__ == '__main__':
