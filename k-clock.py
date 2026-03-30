@@ -122,27 +122,56 @@ def migrate_clock_patterns(pb: Pixelblaze, dest_path: str = 'migration'):
 
 
 def upload_patterns_from_directory(pb: Pixelblaze, src_path: str = 'migration'):
+    # Minimal 1x1 white JPEG fallback for patterns with no preview image
+    BLANK_JPEG = (
+        b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+        b'\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t'
+        b'\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a'
+        b'\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\x1e\xfe'
+        b'\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00'
+        b'\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00'
+        b'\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xc4\x00'
+        b'\xb5\x10\x00\x02\x01\x03\x03\x02\x04\x03\x05\x05\x04\x04\x00\x00'
+        b'\x01}\x01\x02\x03\x00\x04\x11\x05\x12!1A\x06\x13Qa\x07"q\x142\x81'
+        b'\x91\xa1\x08#B\xb1\xc1\x15R\xd1\xf0$3br\x82\t\n\x16\x17\x18\x19'
+        b'\x1a%&\'()*456789:CDEFGHIJSTUVWXYZcdefghijstuvwxyz\x83\x84\x85\x86'
+        b'\x87\x88\x89\x8a\x92\x93\x94\x95\x96\x97\x98\x99\x9a\xa2\xa3\xa4'
+        b'\xa5\xa6\xa7\xa8\xa9\xaa\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xc2'
+        b'\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9'
+        b'\xda\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xf1\xf2\xf3\xf4\xf5'
+        b'\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xfb\xd4'
+        b'P\x00\x00\x00\x00\x1f\xff\xd9'
+    )
+
+    # Map from filename stem to actual device pattern name (for name mismatches)
+    name_overrides = {
+        'Clock spotlights _ rotation 3D': 'Clock spotlights / rotation 3D',
+    }
+
     pattern_list = pb.getPatternList(True)
     name_to_id = {name: pid for pid, name in pattern_list.items()}
 
     js_files = [f for f in os.listdir(src_path) if f.endswith('.js')]
     for file_name in sorted(js_files):
         pattern_name = file_name[:-3]  # strip .js
+        device_name = name_overrides.get(pattern_name, pattern_name)
         src_file = os.path.join(src_path, file_name)
         with open(src_file, 'r') as f:
             source = f.read()
 
-        pattern_id = name_to_id.get(pattern_name)
+        pattern_id = name_to_id.get(device_name)
         if pattern_id is None:
-            logger.info(f"'{pattern_name}' not found on device — skipping")
+            logger.info(f"'{device_name}' not found on device — skipping")
             continue
 
         try:
             preview = pb.getPreviewImage(pattern_id)
-            pb.savePattern(previewImage=preview, sourceCode=source, name=pattern_name, id=pattern_id)
-            logger.info(f"Uploaded '{pattern_name}' ({pattern_id})")
+            if preview is None:
+                preview = BLANK_JPEG
+            pb.savePattern(previewImage=preview, sourceCode=source, name=device_name, id=pattern_id)
+            logger.info(f"Uploaded '{device_name}' ({pattern_id})")
         except Exception as e:
-            logger.info(f"Failed to upload '{pattern_name}': {e}")
+            logger.info(f"Failed to upload '{device_name}': {e}")
 
 
 def build_pattern_file_cache(pb: Pixelblaze) -> dict:
@@ -163,32 +192,24 @@ def build_pattern_file_cache(pb: Pixelblaze) -> dict:
     return cache
 
 
-def ensure_pattern_variables(pb: Pixelblaze, clock_on: int, cache: dict):
+async def ensure_pattern_variables(pb: Pixelblaze, active_pattern: str, scroll_state: int, cache: dict):
     for file_name, (pattern_name, data) in cache.items():
-        changed = False
-        if 'wakeMode' not in data or data['wakeMode'] != 0:
-            data['wakeMode'] = 0
-            changed = True
-        if 'clockOn' not in data or data['clockOn'] != clock_on:
-            data['clockOn'] = clock_on
-            changed = True
-        if changed:
-            logger.info(f"Updating variables in {file_name} ({pattern_name})")
-            pb.putFile(file_name, json.dumps(data).encode())
-
-
-def fire_trigger(pb: Pixelblaze, cache: dict, trigger_name: str):
-    """Set trigger=1 on all Clock patterns that have that control."""
-    for file_name, (pattern_name, data) in cache.items():
-        pattern_id = os.path.basename(file_name).replace('.c', '')
-        try:
-            controls = pb.getPatternControls(pattern_id)
-            if controls and trigger_name in controls:
-                data[trigger_name] = 1
+        if pattern_name != active_pattern:
+            changed = False
+            if 'wakeMode' not in data or data['wakeMode'] != 0:
+                data['wakeMode'] = 0
+                changed = True
+            if 'scrollState' not in data or data['scrollState'] != scroll_state:
+                data['scrollState'] = scroll_state
+                changed = True
+            if changed:
+                logger.info(f"Updating variables in {file_name} ({pattern_name})")
                 pb.putFile(file_name, json.dumps(data).encode())
-                logger.info(f"Set {trigger_name} in {file_name} ({pattern_name})")
-        except Exception as e:
-            logger.info(f"Could not check controls for {pattern_name}: {e}")
+                await asyncio.sleep(1)
+
+
+def fire_trigger(pb: Pixelblaze, active_pattern: str, cache: dict, trigger_name: str):
+    """Set trigger=1 on pb"""
     try:
         pb.setActiveControls({trigger_name: 1})
         logger.info(f"Fired {trigger_name} on active pattern")
@@ -197,6 +218,13 @@ def fire_trigger(pb: Pixelblaze, cache: dict, trigger_name: str):
 
 
 async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
+    pb = Pixelblaze('192.168.86.34')
+    #save_pattern_code(pb, 'Clock Color Cube')
+    pattern_file_cache = build_pattern_file_cache(pb)
+    await ensure_pattern_variables(pb, '', 0, pattern_file_cache)
+    #fire_trigger(pb, pattern_file_cache, 'triggerScrollOut')
+    #fire_trigger(pb, pattern_file_cache, 'triggerScrollIn')
+
     try:
         porcupine = pvporcupine.create(
             access_key=args.access_key,
@@ -257,7 +285,7 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                     logger.info(f"Found k-clock at '{clock_ipaddress}'")
                     pattern_names_list = ["Clock Fire", "Clock honeycomb", "Clock", "coronal mass ejection", "spiral twirls 2D", "pulse 2D", "perlin fire wind", "Coral Plasma"]
                     pattern_file_cache = build_pattern_file_cache(pb)
-                    ensure_pattern_variables(pb, 1, pattern_file_cache)
+                    await ensure_pattern_variables(pb, '', 0, pattern_file_cache)
                     break
         except:
             continue
@@ -322,6 +350,7 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                                                     c_file = f'/p/{moon_id}.c'
                                                     controls = json.loads(pb.getFile(c_file))
                                                     controls['sliderMoonIndex'] = moon_phase_index / 8.0
+                                                    controls['scroll_state'] = 2
                                                     pb.putFile(c_file, json.dumps(controls).encode())
                                                 pb.setActivePatternByName('moon phase')
                                             except Exception as e:
@@ -329,33 +358,15 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                                             await asyncio.sleep(5)
                                             pb.setActivePattern(pattern_before_wake)
                                             pb.playSequencer()
-                                    elif slots['pattern'] == 'random':
-                                        pattern_name = random.choice(pattern_names_list)
-                                        logger.info(f"Set pattern to random: {pattern_name}")
-                                        pb.setActivePatternByName(pattern_name)
                                     elif slots['pattern'] == 'clock on':
                                         logger.info(f"Turn on clock")
-                                        pb.setActiveVariables({"clockOn": 1})
-                                        ensure_pattern_variables(pb, 1, pattern_file_cache)
-                                        fire_trigger(pb, pattern_file_cache, 'triggerScrollIn')
-                                        await asyncio.sleep(1)
+                                        fire_trigger(pb, pattern_before_wake, pattern_file_cache, 'triggerScrollIn')
+                                        await ensure_pattern_variables(pb, pattern_before_wake, 0, pattern_file_cache)
                                     elif slots['pattern'] == 'clock off':
                                         logger.info(f"Turn off clock")
-                                        pb.setActiveVariables({"clockOn": 0})
-                                        ensure_pattern_variables(pb, 0, pattern_file_cache)
-                                        fire_trigger(pb, pattern_file_cache, 'triggerScrollOut')
-                                        await asyncio.sleep(1)
+                                        fire_trigger(pb, pattern_before_wake, pattern_file_cache, 'triggerScrollOut')
+                                        await ensure_pattern_variables(pb, pattern_before_wake, 2, pattern_file_cache)
                                     logger.info("Complete")
-                                    break
-                                elif intent == "nextPattern":
-                                    if slots['player'] == 'continue':
-                                        logger.info(f"Continue sequence")
-                                        pb.setActivePattern(pattern_before_wake)
-                                        pb.playSequencer()
-                                    elif slots['player'] == 'pause':
-                                        logger.info(f"Pause sequence")
-                                        pb.setActivePattern(pattern_before_wake)
-                                        pb.pauseSequencer()
                                     break
     except KeyboardInterrupt:
         logger.info('Stopping ...')

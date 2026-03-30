@@ -229,6 +229,7 @@ var x3 = 0.2
 //   3 = scrolling IN from blank (triggerScrollIn fired)
 
 export var scrollState = 0
+export function inputNumberState(v) { scrollState = clamp(floor(v), 0, 3) }
 export var wakeMode = 0
 export function triggerWakeMode(v) {
   wakeMode = wakeMode == 1 ? 0 : 1
