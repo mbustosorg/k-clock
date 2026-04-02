@@ -143,35 +143,29 @@ def upload_patterns_from_directory(pb: Pixelblaze, src_path: str = 'migration'):
         b'P\x00\x00\x00\x00\x1f\xff\xd9'
     )
 
-    # Map from filename stem to actual device pattern name (for name mismatches)
-    name_overrides = {
-        'Clock spotlights _ rotation 3D': 'Clock spotlights / rotation 3D',
-    }
-
     pattern_list = pb.getPatternList(True)
     name_to_id = {name: pid for pid, name in pattern_list.items()}
 
     js_files = [f for f in os.listdir(src_path) if f.endswith('.js')]
     for file_name in sorted(js_files):
         pattern_name = file_name[:-3]  # strip .js
-        device_name = name_overrides.get(pattern_name, pattern_name)
         src_file = os.path.join(src_path, file_name)
         with open(src_file, 'r') as f:
             source = f.read()
 
-        pattern_id = name_to_id.get(device_name)
+        pattern_id = name_to_id.get(pattern_name)
         if pattern_id is None:
-            logger.info(f"'{device_name}' not found on device — skipping")
+            logger.info(f"'{pattern_name}' not found on device — skipping")
             continue
 
         try:
             preview = pb.getPreviewImage(pattern_id)
             if preview is None:
                 preview = BLANK_JPEG
-            pb.savePattern(previewImage=preview, sourceCode=source, name=device_name, id=pattern_id)
-            logger.info(f"Uploaded '{device_name}' ({pattern_id})")
+            pb.savePattern(previewImage=preview, sourceCode=source, name=pattern_name, id=pattern_id)
+            logger.info(f"Uploaded '{pattern_name}' ({pattern_id})")
         except Exception as e:
-            logger.info(f"Failed to upload '{device_name}': {e}")
+            logger.info(f"Failed to upload '{pattern_name}': {e}")
 
 
 def build_pattern_file_cache(pb: Pixelblaze) -> dict:
@@ -182,9 +176,10 @@ def build_pattern_file_cache(pb: Pixelblaze) -> dict:
             continue
         pattern_id = os.path.basename(file_name).replace('.c', '')
         pattern_name = pattern_list.get(pattern_id, '')
-        if not pattern_name.startswith('Clock'):
+        if not pattern_name.startswith('C '):
             continue
         try:
+            logger.info(f"Reading {pattern_name} file {file_name}")
             data = json.loads(pb.getFile(file_name))
             cache[file_name] = (pattern_name, data)
         except Exception as e:
@@ -192,39 +187,29 @@ def build_pattern_file_cache(pb: Pixelblaze) -> dict:
     return cache
 
 
-async def ensure_pattern_variables(pb: Pixelblaze, active_pattern: str, scroll_state: int, cache: dict):
-    for file_name, (pattern_name, data) in cache.items():
-        if pattern_name != active_pattern:
-            changed = False
-            if 'wakeMode' not in data or data['wakeMode'] != 0:
-                data['wakeMode'] = 0
-                changed = True
-            if 'scrollState' not in data or data['scrollState'] != scroll_state:
-                data['scrollState'] = scroll_state
-                changed = True
-            if changed:
-                logger.info(f"Updating variables in {file_name} ({pattern_name})")
-                pb.putFile(file_name, json.dumps(data).encode())
-                await asyncio.sleep(1)
-
-
-def fire_trigger(pb: Pixelblaze, active_pattern: str, cache: dict, trigger_name: str):
-    """Set trigger=1 on pb"""
-    try:
-        pb.setActiveControls({trigger_name: 1})
-        logger.info(f"Fired {trigger_name} on active pattern")
-    except Exception as e:
-        logger.info(f"Could not fire {trigger_name} on active pattern: {e}")
+def on_and_off_playlists(pb: Pixelblaze) -> dict:
+    play_list = pb.getSequencerPlaylist()
+    pattern_list = pb.getPatternList(True)
+    pattern_list_inv = {v: k for k, v in pattern_list.items()}
+    result = {'off_list': [], 'on_list': []}
+    for playlist_item in play_list['playlist']['items']:
+        if pattern_list[playlist_item['id']].startswith('C '):
+            result['on_list'].append(playlist_item)
+            off_item = playlist_item.copy()
+            off_item['id'] = pattern_list_inv[pattern_list[playlist_item['id']].replace('C ', 'C- ', 1)]
+            result['off_list'].append(off_item)
+        elif pattern_list[playlist_item['id']].startswith('C- '):
+            result['off_list'].append(playlist_item)
+            off_item = playlist_item.copy()
+            off_item['id'] = pattern_list_inv[pattern_list[playlist_item['id']].replace('C- ', 'C ', 1)]
+            result['on_list'].append(off_item)
+        else:
+            result['on_list'].append(playlist_item)
+            result['off_list'].append(playlist_item)
+    return result
 
 
 async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
-    pb = Pixelblaze('192.168.86.34')
-    #save_pattern_code(pb, 'Clock Color Cube')
-    pattern_file_cache = build_pattern_file_cache(pb)
-    await ensure_pattern_variables(pb, '', 0, pattern_file_cache)
-    #fire_trigger(pb, pattern_file_cache, 'triggerScrollOut')
-    #fire_trigger(pb, pattern_file_cache, 'triggerScrollIn')
-
     try:
         porcupine = pvporcupine.create(
             access_key=args.access_key,
@@ -283,9 +268,11 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                 if config["name"] == "k-clock":
                     clock_ipaddress = ipAddress
                     logger.info(f"Found k-clock at '{clock_ipaddress}'")
-                    pattern_names_list = ["Clock Fire", "Clock honeycomb", "Clock", "coronal mass ejection", "spiral twirls 2D", "pulse 2D", "perlin fire wind", "Coral Plasma"]
-                    pattern_file_cache = build_pattern_file_cache(pb)
-                    await ensure_pattern_variables(pb, '', 0, pattern_file_cache)
+                    play_list = on_and_off_playlists(pb)
+                    current_list = pb.getSequencerPlaylist()
+                    current_list['playlist']['items'] = play_list['on_list']
+                    pb.setSequencerPlaylist(current_list)
+                    pb.playSequencer()
                     break
         except:
             continue
@@ -307,27 +294,28 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                     try:
                         now = datetime.now()
                         brightness = (-math.cos(
-                            (now.hour + (now.minute / 60.0)) / 24.0 * 2.0 * math.pi) + 1.0) / 2.0 * 0.45 + 0.3
+                            (now.hour + (now.minute / 60.0)) / 24.0 * 2.0 * math.pi) + 1.0) / 2.0 * 0.45 + 0.2
                         logger.info(f"\tBrightness: {brightness:.2f}")
                         with Pixelblaze(clock_ipaddress) as pb:
                             pb.setBrightnessSlider(brightness)
+                            pb.playSequencer()
                     except Exception as e:
                         logger.info(f"Exception during setting brightness {e}")
             if result >= 0:
                 with Pixelblaze(clock_ipaddress) as pb:
                     logger.info('Detected %s' % (keywords[result]))
                     pattern_before_wake = pb.getActivePattern()
-                    pb.setActiveVariables({'wakeMode': 1})
+                    pb.setActivePatternByName("C wake word")
                     woken = datetime.now()
                     while True:
                         if (datetime.now() - woken).seconds > 5:
                             logger.info("Timeout, going back to listening")
-                            pb.setActiveVariables({'wakeMode': 0})
+                            pb.setActivePattern(pattern_before_wake)
+                            pb.playSequencer()
                             break
                         pcm = recorder.read()
                         is_finalized = rhino.process(pcm)
                         if is_finalized:
-                            pb.setActiveVariables({'wakeMode': 0})
                             inference = rhino.get_inference()
                             if inference.is_understood:
                                 intent = inference.intent
@@ -347,25 +335,30 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                                                 pattern_list = pb.getPatternList(True)
                                                 moon_id = next((pid for pid, name in pattern_list.items() if name == 'moon phase'), None)
                                                 if moon_id:
-                                                    c_file = f'/p/{moon_id}.c'
-                                                    controls = json.loads(pb.getFile(c_file))
+                                                    pb.setActivePatternByName('moon phase')
+                                                    controls = pb.getActiveControls()
                                                     controls['sliderMoonIndex'] = moon_phase_index / 8.0
-                                                    controls['scroll_state'] = 2
-                                                    pb.putFile(c_file, json.dumps(controls).encode())
-                                                pb.setActivePatternByName('moon phase')
+                                                    pb.setActiveControls(controls)
+                                                    await asyncio.sleep(5)
+                                                    controls['sliderMoonIndex'] = 0
+                                                    pb.setActiveControls(controls)
+                                                    pb.setActivePattern(pattern_before_wake)
+                                                    pb.playSequencer()
                                             except Exception as e:
-                                                logger.info(f"Exception during setting weather and variables {e}")
-                                            await asyncio.sleep(5)
-                                            pb.setActivePattern(pattern_before_wake)
-                                            pb.playSequencer()
+                                                logger.info(f"Exception during setting pattern {e}")
                                     elif slots['pattern'] == 'clock on':
                                         logger.info(f"Turn on clock")
-                                        fire_trigger(pb, pattern_before_wake, pattern_file_cache, 'triggerScrollIn')
-                                        await ensure_pattern_variables(pb, pattern_before_wake, 0, pattern_file_cache)
+                                        current_list = pb.getSequencerPlaylist()
+                                        current_list['playlist']['items'] = play_list['on_list']
+                                        pb.setSequencerPlaylist(current_list)
+                                        pb.setSequencerPlaylist(play_list['on_list'])
+                                        pb.playSequencer()
                                     elif slots['pattern'] == 'clock off':
                                         logger.info(f"Turn off clock")
-                                        fire_trigger(pb, pattern_before_wake, pattern_file_cache, 'triggerScrollOut')
-                                        await ensure_pattern_variables(pb, pattern_before_wake, 2, pattern_file_cache)
+                                        current_list = pb.getSequencerPlaylist()
+                                        current_list['playlist']['items'] = play_list['off_list']
+                                        pb.setSequencerPlaylist(current_list)
+                                        pb.playSequencer()
                                     logger.info("Complete")
                                     break
     except KeyboardInterrupt:
