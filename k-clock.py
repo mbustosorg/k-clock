@@ -298,34 +298,43 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                         logger.info(f"\tBrightness: {brightness:.2f}")
                         with Pixelblaze(clock_ipaddress) as pb:
                             pb.setBrightnessSlider(brightness)
-                            pb.playSequencer()
                     except Exception as e:
                         logger.info(f"Exception during setting brightness {e}")
             if result >= 0:
+                logger.info('Detected %s' % (keywords[result]))
                 with Pixelblaze(clock_ipaddress) as pb:
-                    logger.info('Detected %s' % (keywords[result]))
+                    pb.pauseSequencer()
+                    pb.wsSendJson(
+                        {"transitionDuration": 0, "save": False},
+                        expectedResponse=None,
+                    )
                     pattern_before_wake = pb.getActivePattern()
                     pb.setActivePatternByName("C wake word")
-                    woken = datetime.now()
-                    while True:
-                        if (datetime.now() - woken).seconds > 5:
-                            logger.info("Timeout, going back to listening")
+                woken = datetime.now()
+                while True:
+                    if (datetime.now() - woken).seconds > 5:
+                        logger.info("Timeout, going back to listening")
+                        with Pixelblaze(clock_ipaddress) as pb:
                             pb.setActivePattern(pattern_before_wake)
                             pb.playSequencer()
+                            pb.wsSendJson(
+                                {"transitionDuration": 10, "save": False},
+                                expectedResponse=None,
+                            )
                             break
-                        pcm = recorder.read()
-                        is_finalized = rhino.process(pcm)
-                        if is_finalized:
-                            inference = rhino.get_inference()
-                            if inference.is_understood:
-                                intent = inference.intent
-                                slots = inference.slots
-                                if intent == "setPattern":
-                                    active_pattern = pb.getActivePattern()
-                                    if slots['pattern'] == 'time' and active_pattern != 'time':
+                    pcm = recorder.read()
+                    is_finalized = rhino.process(pcm)
+                    if is_finalized:
+                        inference = rhino.get_inference()
+                        if inference.is_understood:
+                            intent = inference.intent
+                            slots = inference.slots
+                            if intent == "setPattern":
+                                with Pixelblaze(clock_ipaddress) as pb:
+                                    if slots['pattern'] == 'time':
                                         logger.info("Set pattern to time")
                                         pb.setActivePatternByName('Clock')
-                                    elif slots['pattern'] == 'moon phase' and active_pattern != 'moon_phase':
+                                    elif slots['pattern'] == 'moon phase':
                                         logger.info("Set pattern to moon phase")
                                         async with python_weather.Client(unit=python_weather.IMPERIAL) as client:
                                             try:
@@ -343,22 +352,24 @@ async def listen_and_process(args: Namespace, keyword_paths: list[Any] | Any):
                                                     controls['sliderMoonIndex'] = 0
                                                     pb.setActiveControls(controls)
                                                     pb.setActivePattern(pattern_before_wake)
-                                                    pb.playSequencer()
                                             except Exception as e:
-                                                logger.info(f"Exception during setting pattern {e}")
+                                                logger.info(f"Exception during setting moon pattern {e}")
                                     elif slots['pattern'] == 'clock on':
                                         logger.info(f"Turn on clock")
                                         current_list = pb.getSequencerPlaylist()
                                         current_list['playlist']['items'] = play_list['on_list']
                                         pb.setSequencerPlaylist(current_list)
-                                        pb.setSequencerPlaylist(play_list['on_list'])
-                                        pb.playSequencer()
                                     elif slots['pattern'] == 'clock off':
                                         logger.info(f"Turn off clock")
                                         current_list = pb.getSequencerPlaylist()
                                         current_list['playlist']['items'] = play_list['off_list']
                                         pb.setSequencerPlaylist(current_list)
-                                        pb.playSequencer()
+                                    pb.playSequencer()
+                                    await asyncio.sleep(5)
+                                    pb.wsSendJson(
+                                        {"transitionDuration": 10, "save": False},
+                                        expectedResponse=None,
+                                    )
                                     logger.info("Complete")
                                     break
     except KeyboardInterrupt:
